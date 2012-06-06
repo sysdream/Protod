@@ -1,0 +1,405 @@
+#!/usr/bin/python
+
+"""
+Protod, version 1.0 - Linux version
+
+Copyright (c) 2012 SYSDREAM
+
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell 
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
+OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Author: Damien Cauquil <d.cauquil@sysdream.com>
+
+"""
+
+import sys
+import struct
+import re
+import os
+import copy
+
+from google.protobuf.descriptor_pb2 import FileDescriptorProto,FieldDescriptorProto
+from google.protobuf.message import DecodeError
+
+#############################
+# Namespace management
+#############################
+
+class Node:
+	def __init__(self, package_name, nested=False, parent=None,filename=None):
+		self.name = package_name
+		self.parent = parent
+		self.filename = filename
+		self.nested = nested
+		self.children = []
+
+	def addChildNode(self, node):
+		self.children.append(node)
+		node.setParent(self)
+		
+	def setParent(self, parent):
+		self.parent = parent 
+		
+	def getParent(self):
+		return self.parent
+
+	def getFile(self):
+		return self.filename
+		
+	def getName(self):
+		return self.name
+		
+	def walk(self, path):
+		nodes = path.split('.')
+		if len(nodes)==0:
+			return None
+		else:
+			for child in self.children:
+				if child.name == nodes[0]:
+					if len(nodes[1:])>0:
+						return child.walk('.'.join(nodes[1:]))
+					else:
+						return child
+			return None
+
+	def getParentPackage(self,inprogress=False):
+		if self.nested:
+			return self.parent.getParentPackage()
+		else:
+			if self.parent is None:
+				return self.name
+			else:
+				if inprogress:
+					return self.parent.getParentPackage(inprogress=True)+'.'+self.name
+				else:
+					return self.parent.getParentPackage(inprogress=True)
+			
+	def generateType(self, allow_nested=False):
+		if self.nested and not allow_nested:
+			return self.parent.generateType()+'.'+self.name
+		else:
+			return self.name
+			
+	def generateImport(self):
+		if self.nested:
+			return self.parent.generateImport()
+		else:
+			return 'import "%s"\n' % self.filename
+			
+			
+	def show(self, depth=0):
+		print '%s+ %s' % (' '*depth,self.name)
+		for child in self.children:
+			child.show(depth+1)
+			
+class PackageList:
+	def __init__(self, root=''):
+		self.root_node = Node(root,filename='')
+		
+	def createNodeTree(self, path, filename, nested=False):
+		nodes = path.split('.')
+		root_node = None
+		prev_node = None
+		for node in nodes:
+			_node = Node(node, filename=filename, nested=nested,parent=prev_node)
+			if prev_node is not None:
+				prev_node.addChildNode(_node)
+				prev_node = _node
+			else:
+				root_node = _node
+				prev_node = root_node
+		return root_node
+		
+	def mergeNodeTree(self, tree):
+		# walk the root node until tree is the same
+		# when tree differs, link the tree to the last matching node
+		iter_node = self.root_node
+		tree_iter_node = tree
+		last_node = None
+		while iter_node is not None:
+			last_node = iter_node
+			found = False
+			for child in last_node.children:
+				if child.name == tree_iter_node.name:
+					iter_node = child
+					if len(tree_iter_node.children)>0:
+						tree_iter_node = tree_iter_node.children[0]
+						found = True
+			if not found:
+				last_node.addChildNode(tree_iter_node)
+				tree_iter_node.setParent(last_node)
+				break
+
+	def registerPackage(self, package_name, filename, nested=False):
+		t = self.createNodeTree(package_name, filename, nested)
+		self.mergeNodeTree(t)
+		
+	def findPackage(self, package_name):
+		return self.root_node.walk(package_name)
+				
+	def show(self, node=None, depth=0):
+		if node is None:
+			self.root_node.show(depth)
+		else:
+			node.show(depth)
+			
+
+packages = PackageList()
+
+
+#############################
+# Compiled metadata parsing
+#############################
+
+
+class FileDescriptorDisassembler:
+	def __init__(self, file_desc):
+		self.desc = file_desc
+
+	def getLabel(self, l):
+		return [None, 'optional','required','repeated'][l]
+
+	def getTypeStr(self, t):
+		types = [
+			None,
+			'double',
+			'float',
+			'int64',
+			'uint64',
+			'int32',
+			'fixed64',
+			'fixed32',
+			'bool',
+			'string',
+			'group',
+			'message',
+			'bytes',
+			'uint32',
+			'enum',
+			'sfixed32',
+			'sfixed64',
+			'sint32',
+			'sint64'
+		]
+		return types[t]
+		
+	def index(self):
+		"""
+		Index names
+		"""
+		# First, index proto
+		packages.registerPackage(self.desc.package,self.desc.name)
+		
+		# Loop on every enum ...
+		if len(self.desc.enum_type)>0:
+			for enum in self.desc.enum_type:
+				# ... and index their names
+				packages.registerPackage(self.desc.package+'.'+enum.name,self.desc.name)
+		
+		# Loop on every message
+		if len(self.desc.message_type)>0:
+			for message in self.desc.message_type:
+				self.indexField(message, self.desc.package)
+			
+	def indexField(self, message, package, nested=False):
+		"""
+		Index fields recursively
+		"""
+		# First, index message name
+		packages.registerPackage(package+'.'+message.name,self.desc.name)
+		
+		# index nested types if required
+		if len(message.nested_type)>0:
+			for nested in message.nested_type:
+				self.indexField(nested, package+'.'+message.name, nested=True)
+		
+		# index enum types if required
+		if len(message.enum_type)>0:
+			for enum in message.enum_type:
+				self.indexEnum(enum, package+'.'+message.name, nested=True)
+					
+	def indexEnum(self, enum, package, nested=False):
+		"""
+		Index enums
+		"""
+		packages.registerPackage(package+'.'+enum.name, self.desc.name, nested=nested)
+		
+		# register values as nested
+		if len(enum.value)>0:
+			for value in enum.value:
+				packages.registerPackage(package+'.'+enum.name+'.'+value.name, self.desc.name, nested=True)
+
+	def renderEnum(self, enum, depth=0, package=''):
+		_package = package +'.'+field['name']
+		buffer = '\n'
+		buffer += '%senum %s {\n' % (' '*depth,enum.name)
+		for value in enum.value:
+			buffer += '%s%s = %d;\n' % (' '*(depth+1), value.name,value.number)
+		buffer += '%s}' % (' '*depth)
+		buffer += '\n'
+		return buffer
+
+	def renderField(self, field, depth=0, package='', nested=False):
+		buffer = ''
+		try:
+			if field.HasField('type'):
+				# message case
+				if field.type==FieldDescriptorProto.TYPE_MESSAGE or field.type==FieldDescriptorProto.TYPE_ENUM:
+					p = packages.findPackage(field.type_name[1:])
+					if p:
+						if p.getParentPackage() == packages.findPackage(package).getParentPackage(True):
+							field.type_name = p.generateType(allow_nested=True)
+						else:
+							print '[!] Oops: %s %s %s' % (p.getParentPackage(), packages.findPackage(package).getParentPackage(), package)
+					else:
+						print '[!] Package %s not found' % field.type_name[1:]
+					buffer += '%s%s %s %s = %d;\n' % (' '*depth, self.getLabel(field.label),field.type_name,field.name,field.number)
+				else:
+					if field.HasField('default_value'):
+						buffer += '%s%s %s %s = %d [default = %s];\n' % (' '*depth, self.getLabel(field.label), self.getTypeStr(field.type), field.name, field.number, field.default_value)
+					else:	
+						buffer += '%s%s %s %s = %d;\n' % (' '*depth, self.getLabel(field.label), self.getTypeStr(field.type), field.name, field.number)
+		except ValueError:
+			buffer += '%smessage %s {\n' % (' '*depth,field.name)
+			_package = package+'.'+field.name
+			
+			if len(field.nested_type)>0:
+				for nested in field.nested_type:
+					buffer += self.renderField(nested, depth+1, _package, nested=True)
+			if len(field.enum_type)>0:
+				for enum in field.enum_type:
+					buffer += self.renderEnum(nested, depth+1, _package)
+			if len(field.field)>0:
+				for field in field.field:
+					buffer += self.renderField(field, depth+1, _package)
+			buffer += '%s}' % (' '*depth)
+			buffer += '\n\n'
+		return buffer
+
+
+	def render(self, filename=None):
+		print '[+] Processing %s' % self.desc.name
+		buffer = ''
+		buffer += 'package %s;\n\n' % self.desc.package
+
+		if len(self.desc.enum_type)>0:
+			for enum in self.desc.enum_type:
+				buffer += self.renderEnum(enum, package=self.desc.package)
+		if len(self.desc.message_type)>0:
+			for message in self.desc.message_type:
+				buffer += self.renderField(message, package=self.desc.package)
+		if filename:
+			_dir = os.path.dirname(filename)
+			if _dir!='' and not os.path.exists(_dir):
+				os.makedirs(_dir)
+			open(filename,'w').write(buffer)
+		else:	    
+			_dir = os.path.dirname(self.desc.name)
+			if _dir!='' and not os.path.exists(_dir):
+				os.makedirs(_dir)
+			open(self.desc.name,'w').write(buffer)
+
+#############################
+# Main code
+#############################
+
+class ProtobufElfExtractor:
+	def __init__(self, filename=None):
+		self.filename = filename
+	
+	def extract(self):
+		# we read the whole file
+		try:
+			content = open(self.filename,'rb').read()
+			
+			# we try to identify every stored proto file
+			found = True
+			buffer = content
+			protos = []
+			proto_start = 0
+			while found:
+				found = False
+				try:
+					# locate protobuf metadata name (based on its ext.)
+					proto_ext_start = buffer.index('.proto')					
+					
+					found = True					
+					
+					# rewind to find a null byte, and then extract file name
+					metadata_start = proto_ext_start
+					while ord(buffer[metadata_start])!=0:
+						metadata_start -= 1
+					metadata_start += 1
+						
+					# grab file content
+					metadata_end = buffer[metadata_start:].index("\x00\x00")
+					_content = buffer[metadata_start:metadata_start+metadata_end]
+					buffer = buffer[metadata_start+metadata_end:]
+
+					# recover the extractable data
+					working_data = False
+					while not working_data and len(_content)>0:
+						try:
+							fds  = FileDescriptorProto()
+							fds.ParseFromString(_content)
+							working_data = True
+							protos.append(_content)
+						except DecodeError,erreur:
+							_content = _content[:-1]					
+				except ValueError,e:
+					pass
+
+			# we build the names and namespaces index
+			for content in protos:
+				try:
+					# we load the prototype
+					fds  = FileDescriptorProto()
+					fds.ParseFromString(content)
+					res = FileDescriptorDisassembler(fds)
+					if len(res.desc.name)>0:
+						res.index()
+				except DecodeError,erreur:
+					print '[!] Error with %s' % proto_file
+					pass
+					
+			# we load successively each binary proto file and rebuild it from scratch
+			for content in protos:
+				try:
+					# we load the prototype
+					fds  = FileDescriptorProto()
+					fds.ParseFromString(content)
+					res = FileDescriptorDisassembler(fds)
+					if len(res.desc.name)>0:
+						open(res.desc.package+'.protoc','wb').write(content)
+						open(res.desc.package+'.decoded','w').write(str(res))
+						res.render()
+				except DecodeError, erreur:
+					pass
+		except IOError:
+			print '[!] Unable to read %s' % sys.argv[1]		
+
+if __name__ == '__main__':	
+	if len(sys.argv)>=2:
+		print "[i] Extracting from %s ..." % sys.argv[1]
+		extractor = ProtobufElfExtractor(sys.argv[1])
+		extractor.extract()
+		print "[i] Done"
+	else:
+		print "[ Protod (Protobuf metadata extractor) (c) 2012 Sysdream  ]"
+		print ''
+		print '[i] Usage: %s [executable]' % sys.argv[0]
