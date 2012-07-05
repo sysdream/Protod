@@ -342,9 +342,9 @@ class ProtobufElfExtractor:
 					
 					# rewind to find a null byte, and then extract file name
 					metadata_start = proto_ext_start
-					while ord(buffer[metadata_start])!=0:
+					while ord(buffer[metadata_start])!=0x0A:
 						metadata_start -= 1
-					metadata_start += 1
+					#metadata_start += 1
 						
 					# grab file content
 					metadata_end = buffer[metadata_start:].index("\x00\x00")
