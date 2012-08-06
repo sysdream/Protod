@@ -5,8 +5,7 @@ WHAT IS PROTOD ?
 ----------------
 
 Protod is a tool able to extract Google's protobuf metadata from any binary
-file. This version has been designed to cover only Elf file format, but
-basically it should work on many other formats.
+file. This version has been designed to cover every file format.
 
 The goal of this tool is to recover serialized protobuf's metadata inserted
 at compilation time inside an executable, and to make it available as .proto
@@ -41,5 +40,5 @@ and ideas !
 THANKS
 ------
 
-Greatt thanks to UNclePecos for his time, and all the Sysdream's staff for
+Great thanks to UNclePecos for his time, and all the Sysdream's staff for
 their support.
